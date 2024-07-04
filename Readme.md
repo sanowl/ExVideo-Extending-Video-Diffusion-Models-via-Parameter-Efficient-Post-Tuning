@@ -157,7 +157,3 @@ If you use ExVideo in your research, please cite our paper:
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-For more information, visit our [project website](https://example.com/exvideo) or contact us at exvideo@example.com.
