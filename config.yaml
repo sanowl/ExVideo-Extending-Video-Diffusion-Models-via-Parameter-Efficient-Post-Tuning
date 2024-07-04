@@ -1,0 +1,13 @@
+model:
+  hidden_dim: 512
+  num_frames: 256
+
+training:
+  learning_rate: 0.001
+  batch_size: 32
+  num_epochs: 100
+  early_stopping_patience: 10
+
+data:
+  train_path: "/path/to/train/data"
+  val_path: "/path/to/val/data"
