@@ -11,15 +11,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import numpy as np
 from typing import Dict, Any
-
-# Conditional import for MLX
-try:
-    import mlx.core as mx
-    import mlx.nn as mnn
-    import mlx.optimizers as moptim
-    HAS_MLX = True
-except ImportError:
-    HAS_MLX = False
+from torchvision import datasets, transforms
 
 def load_config(config_path: str) -> Dict[str, Any]:
     """
@@ -64,25 +56,23 @@ class ExVideoModel(nn.Module):
         super().__init__()
         self.hidden_dim = config['model']['hidden_dim']
         self.num_frames = config['model']['num_frames']
-        # Add your model layers here
-        self.layer = nn.Linear(self.hidden_dim, self.hidden_dim)
+        
+        # Simple model layers for CIFAR-10 (3x32x32 images)
+        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.conv3 = nn.Conv2d(32, 64, 3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(64 * 4 * 4, self.hidden_dim)
+        self.fc2 = nn.Linear(self.hidden_dim, 10)  # CIFAR-10 has 10 classes
 
     def forward(self, x):
-        return self.layer(x)
-
-if HAS_MLX:
-    class ExVideoModelMLX(mnn.Module):
-        """
-        MLX implementation of the ExVideo model.
-        """
-        def __init__(self, config):
-            super().__init__()
-            self.hidden_dim = config['model']['hidden_dim']
-            self.num_frames = config['model']['num_frames']
-            self.layer = mnn.Linear(self.hidden_dim, self.hidden_dim)
-
-        def __call__(self, x):
-            return self.layer(x)
+        x = self.pool(nn.functional.relu(self.conv1(x)))
+        x = self.pool(nn.functional.relu(self.conv2(x)))
+        x = self.pool(nn.functional.relu(self.conv3(x)))
+        x = x.view(-1, 64 * 4 * 4)
+        x = nn.functional.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
 class EarlyStopping:
     """
@@ -116,74 +106,52 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, model, path):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model ...')
-        if HAS_MLX:
-            mx.savez(path, **{k: v.numpy() for k, v in model.parameters.items()})
-        else:
-            torch.save(model.state_dict(), path)
+        torch.save(model.state_dict(), path)
         self.val_loss_min = val_loss
 
 class YourDataset(Dataset):
     """
-    Placeholder for your custom dataset.
+    Wrapper for CIFAR-10 dataset.
     """
-    def __init__(self, data_path):
-        # Initialize your dataset here
-        pass
+    def __init__(self, train=True):
+        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
+        self.dataset = datasets.CIFAR10(root='./data', train=train, download=True, transform=transform)
 
     def __len__(self):
-        # Return the size of the dataset
-        return 100  # Placeholder value
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        # Return a single item from the dataset
-        return torch.randn(3, 224, 224), torch.randint(0, 10, (1,)).item()  # Placeholder values
+        return self.dataset[idx]
 
-def train_epoch(model, dataloader, optimizer, device, is_mlx):
+def train_epoch(model, dataloader, optimizer, device):
     """
     Train the model for one epoch.
     """
     model.train()
     total_loss = 0
     for batch in tqdm(dataloader, desc="Training"):
-        if is_mlx:
-            x, y = batch
-            def loss_fn(model, x, y):
-                y_pred = model(x)
-                return mnn.losses.cross_entropy(y_pred, y)
-            loss, grads = mx.value_and_grad(loss_fn)(model, x, y)
-            optimizer.update(model, grads)
-        else:
-            x, y = batch
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            output = model(x)
-            loss = nn.functional.cross_entropy(output, y)
-            loss.backward()
-            optimizer.step()
+        x, y = batch
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        output = model(x)
+        loss = nn.functional.cross_entropy(output, y)
+        loss.backward()
+        optimizer.step()
         total_loss += loss.item()
     return total_loss / len(dataloader)
 
-def validate(model, dataloader, device, is_mlx):
+def validate(model, dataloader, device):
     """
     Validate the model on the validation set.
     """
     model.eval()
     total_loss = 0
-    if not is_mlx:
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Validating"):
-                x, y = batch
-                x, y = x.to(device), y.to(device)
-                output = model(x)
-                loss = nn.functional.cross_entropy(output, y)
-                total_loss += loss.item()
-    else:
+    with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating"):
             x, y = batch
-            def loss_fn(model, x, y):
-                y_pred = model(x)
-                return mnn.losses.cross_entropy(y_pred, y)
-            loss = loss_fn(model, x, y)
+            x, y = x.to(device), y.to(device)
+            output = model(x)
+            loss = nn.functional.cross_entropy(output, y)
             total_loss += loss.item()
     return total_loss / len(dataloader)
 
@@ -203,39 +171,29 @@ def train(config, args):
     """
     rank, world_size = setup_distributed()
     is_distributed = world_size > 1
-    is_mlx = HAS_MLX
 
     # Device selection
-    if is_mlx:
-        device = mx.cpu
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device(f"cuda:{rank}" if is_distributed else "cuda")
     else:
         device = torch.device("cpu")
 
     # Model initialization
-    if is_mlx:
-        model = ExVideoModelMLX(config)
-    else:
-        model = ExVideoModel(config)
-        model = model.to(device)
-        if is_distributed:
-            model = DDP(model, device_ids=[rank] if torch.cuda.is_available() else None)
+    model = ExVideoModel(config)
+    model = model.to(device)
+    if is_distributed:
+        model = DDP(model, device_ids=[rank] if torch.cuda.is_available() else None)
 
     # Optimizer
     learning_rate = float(config['training']['learning_rate'])  # Ensure learning_rate is a float
-    if is_mlx:
-        optimizer = moptim.Adam(learning_rate=learning_rate)
-    else:
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     # Learning rate scheduler
-    if not is_mlx:
-        scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
 
     # Dataset and DataLoader
-    train_dataset = YourDataset(config['data']['train_path'])
-    val_dataset = YourDataset(config['data']['val_path'])
+    train_dataset = YourDataset(train=True)  # Use CIFAR-10 for training
+    val_dataset = YourDataset(train=False)  # Use CIFAR-10 for validation
 
     if is_distributed:
         train_sampler = DistributedSampler(train_dataset)
@@ -255,34 +213,27 @@ def train(config, args):
         if is_distributed:
             train_sampler.set_epoch(epoch)
         
-        train_loss = train_epoch(model, train_dataloader, optimizer, device, is_mlx)
-        val_loss = validate(model, val_dataloader, device, is_mlx)
+        train_loss = train_epoch(model, train_dataloader, optimizer, device)
+        val_loss = validate(model, val_dataloader, device)
 
         print(f"Epoch {epoch+1}/{config['training']['num_epochs']}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
-        # Learning rate scheduling (for PyTorch)
-        if not is_mlx:
-            scheduler.step(val_loss)
+        # Learning rate scheduling
+        scheduler.step(val_loss)
 
         # Checkpointing
         is_best = val_loss < best_val_loss
         best_val_loss = min(val_loss, best_val_loss)
         
-        if not is_mlx:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'best_val_loss': best_val_loss,
-            }, is_best, f"checkpoint_epoch_{epoch+1}.pth")
-        else:
-            # For MLX, we'll just save the model parameters
-            mx.savez(f"checkpoint_epoch_{epoch+1}.npz", **{k: v.numpy() for k, v in model.parameters.items()})
-            if is_best:
-                mx.savez("best_model.npz", **{k: v.numpy() for k, v in model.parameters.items()})
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'best_val_loss': best_val_loss,
+        }, is_best, f"checkpoint_epoch_{epoch+1}.pth")
 
         # Early stopping check
-        early_stopping(val_loss, model, 'early_stopping_checkpoint.pth' if not is_mlx else 'early_stopping_checkpoint.npz')
+        early_stopping(val_loss, model, 'early_stopping_checkpoint.pth')
         if early_stopping.early_stop:
             print("Early stopping triggered")
             break
@@ -299,3 +250,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
